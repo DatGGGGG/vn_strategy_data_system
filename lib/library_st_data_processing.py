@@ -1691,3 +1691,41 @@ def calculate_revenue_and_growth_by_classification(df_revenue_with_genres, class
     growth_and_cagr = pd.concat([yoy_growth.add_suffix('_YoY'), cagr_df], axis=1)
 
     return total_revenue, growth_and_cagr
+
+def create_mapping_publisher_to_apps_publisherids(path_to_mapping_publisher_to_apps, api_key, base_url):
+    print("Reading csv file: mapping publisher to apps...")
+    df_store_account_data_top_down_manual_cleaning = pd.read_csv(path_to_mapping_publisher_to_apps)
+
+    df_store_account_data_top_down_manual_cleaning["app_id_trimmed"] = (
+        df_store_account_data_top_down_manual_cleaning["app_id_trimmed"].astype(str).str.strip()
+    )
+
+    lod_store_account_data_top_down_manual_cleaning = df_store_account_data_top_down_manual_cleaning.to_dict(orient='records')
+    ios_app_id_list_store_account_top_down_manual_cleaning = list(map(lambda x: x['app_id_trimmed'], list(filter(lambda x: x['os'] == 'ios', lod_store_account_data_top_down_manual_cleaning))))
+    android_app_id_list_store_account_top_down_manual_cleaning = list(map(lambda x: x['app_id_trimmed'], list(filter(lambda x: x['os'] == 'android', lod_store_account_data_top_down_manual_cleaning))))
+    
+    print("Get ST publisher info for ios apps...")
+    ios_app_info_list_store_account_top_down_manual_cleaning = get_local_app_info(api_key, base_url, "ios", ios_app_id_list_store_account_top_down_manual_cleaning )
+    
+    print("Get ST publisher info for Android apps...")
+    android_app_info_list_store_account_top_down_manual_cleaning = get_local_app_info(api_key, base_url, "android", android_app_id_list_store_account_top_down_manual_cleaning)
+
+    df_all_app_info_store_account_top_down_manual_cleaning = pd.concat(
+        [
+            pd.DataFrame(ios_app_info_list_store_account_top_down_manual_cleaning),
+            pd.DataFrame(android_app_info_list_store_account_top_down_manual_cleaning)
+        ],
+        ignore_index=True
+    )
+
+    df_all_app_info_store_account_top_down_manual_cleaning['app_id'] = df_all_app_info_store_account_top_down_manual_cleaning['app_id'].astype(str)
+
+    df_store_account_data_top_down = pd.merge(
+        df_store_account_data_top_down_manual_cleaning,
+        df_all_app_info_store_account_top_down_manual_cleaning,
+        left_on = "app_id_trimmed",
+        right_on = "app_id",
+        how = "left"
+    )[['os_x', 'cleaned_publisher_name', 'game_name', 'sensor_tower_link', 'app_id_trimmed', 'publisher_id', 'publisher_name']]
+
+    return df_store_account_data_top_down
