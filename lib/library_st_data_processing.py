@@ -340,6 +340,43 @@ def get_local_app_info(api_key, base_url, os, app_ids):
     
     return all_responses
 
+def get_local_app_info_from_game_full_info_table(api_key, base_url, df_game_full_info):
+    
+    print("Extracting app list from game table...")
+    list_of_dicts_game_app_list = []
+
+    for index,row in df_game_full_info.iterrows():
+        list_of_dicts_game_app_list.append(
+            {
+                'unified_app_id': row['unified_app_id'],
+                'itunes_apps': ast.literal_eval(str(row['itunes_apps'])),
+                'android_apps': ast.literal_eval(str(row['android_apps'])),
+                'itunes_publisher_ids': ast.literal_eval(str(row['itunes_publisher_ids'])),
+                'android_publisher_ids': ast.literal_eval(str(row['android_publisher_ids'])),
+            }
+        )
+
+    all_app_ids = get_app_id_lists(list_of_dicts_game_app_list)
+
+    ios_app_id_list = list(map(lambda x: x['app_id'], list(filter(lambda x: x['os'] == 'ios', all_app_ids))))
+    android_app_id_list = list(map(lambda x: x['app_id'], list(filter(lambda x: x['os'] == 'android', all_app_ids))))
+
+    print("Getting iOS apps info...")
+    ios_app_info_list = get_local_app_info(api_key, base_url, "ios", ios_app_id_list)
+
+    print("Getting Android apps info...")
+    android_app_info_list = get_local_app_info(api_key, base_url, "android", android_app_id_list)
+
+    df_ios_app_info_list = pd.DataFrame(ios_app_info_list)
+    df_android_app_info_list = pd.DataFrame(android_app_info_list)
+
+    df_all_app_info_list = pd.concat(
+        [df_ios_app_info_list, df_android_app_info_list],
+        ignore_index=True
+    )
+
+    return df_all_app_info_list
+
 def get_unified_id(local_app_id):
     return list(filter(lambda x: x['app_id'] == local_app_id, local_id_to_unified_id_mapping))[0]['unified_app_id']
 
@@ -1729,3 +1766,32 @@ def create_mapping_publisher_to_apps_publisherids(path_to_mapping_publisher_to_a
     )[['os_x', 'cleaned_publisher_name', 'game_name', 'sensor_tower_link', 'app_id_trimmed', 'publisher_id', 'publisher_name']]
 
     return df_store_account_data_top_down
+
+def create_mapping_publisher_to_publisherids_revenue_multiplier(df_top_down, df_bottom_up):
+    df_mapping_cleaned_publisher_to_revenue_multiplier = df_bottom_up[['cleaned_publisher_name', 'revenue_multiplier']].drop_duplicates().reset_index(drop = True)
+    df_top_down_cleaning = pd.merge(
+        df_top_down,
+        df_mapping_cleaned_publisher_to_revenue_multiplier,
+        on = 'cleaned_publisher_name',
+        how = 'left'
+    )[['cleaned_publisher_name', 'publisher_id', 'publisher_name', 'revenue_multiplier']].drop_duplicates()
+    
+    df_full = pd.concat(
+        [df_bottom_up, df_top_down_cleaning]
+    ).drop_duplicates().reset_index(drop=True)
+
+    print("Merging is complete, now have the full mapping table. But need to double check for rows having null publisher_id")
+
+    print("These are rows having null publisher_id:")
+
+    df_null_pub_rows = df_full[df_full['publisher_id'].isnull()]
+
+    print(df_null_pub_rows)
+
+    print("Best to check again these rows. Potential reasons: apps become inactive in the country of interest; app id typo; app id changed by SensorTower; etc.")
+
+    print("Removing these rows from the merged mapping table...")
+    
+    df_full = df_full[df_full['publisher_id'].notnull()]
+
+    return df_full
