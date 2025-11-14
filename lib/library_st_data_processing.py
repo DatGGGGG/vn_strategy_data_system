@@ -375,7 +375,7 @@ def get_local_app_info_from_game_full_info_table(api_key, base_url, df_game_full
         ignore_index=True
     )
 
-    return df_all_app_info_list
+    return df_all_app_info_list.drop_duplicates()
 
 def get_unified_id(local_app_id):
     return list(filter(lambda x: x['app_id'] == local_app_id, local_id_to_unified_id_mapping))[0]['unified_app_id']
@@ -1795,3 +1795,59 @@ def create_mapping_publisher_to_publisherids_revenue_multiplier(df_top_down, df_
     df_full = df_full[df_full['publisher_id'].notnull()]
 
     return df_full
+
+def add_cleaned_publisher_name_and_revenue_multiplier_to_app_full_info(df_app_full_info, df_mapping_publisher_to_publiserid_and_revenue_multiplier_full):
+    
+    # Get the dictionary mapping table publisher_id - cleaned_publisher_name
+    dict_publisher_id_cleaned_publisher_name = dict()
+    for index, row in df_mapping_publisher_to_publiserid_and_revenue_multiplier_full.iterrows():
+        dict_publisher_id_cleaned_publisher_name[str(row['publisher_id'])] = row['cleaned_publisher_name']
+
+    # Get the mapping table publisher_id - multiplier
+    dict_publisher_id_revenue_multiplier = dict()
+    for index, row in df_mapping_publisher_to_publiserid_and_revenue_multiplier_full.iterrows():
+        dict_publisher_id_revenue_multiplier[str(row['publisher_id'])] = row['revenue_multiplier']
+
+    def cast_cleaned_publisher_name(row):
+        if str(row['publisher_id']) in dict_publisher_id_cleaned_publisher_name.keys():
+            return dict_publisher_id_cleaned_publisher_name[str(row['publisher_id'])]
+        else:
+            return ""
+    
+    def cast_revenue_multiplier(row):
+        if str(row['publisher_id']) in dict_publisher_id_revenue_multiplier.keys():
+            return dict_publisher_id_revenue_multiplier[str(row['publisher_id'])]
+        else:
+            return 1
+    
+    df_app_full_info_copy = df_app_full_info.copy()
+
+    df_app_full_info_copy['cleaned_publisher_name'] = df_app_full_info_copy.apply(cast_cleaned_publisher_name, axis=1)
+    df_app_full_info_copy['revenue_multiplier'] = df_app_full_info_copy.apply(cast_revenue_multiplier, axis=1)
+
+    return df_app_full_info_copy
+
+def adjust_cleaned_publisher_name_and_revenue_multiplier_of_app_full_info_special_cases(df_app_full_info_adjusted, df_mapping_app_to_revenue_multiplier_special_case):
+
+    dict_mapping_app_to_revenue_multiplier_special_case = dict()
+    for index, row in df_mapping_app_to_revenue_multiplier_special_case.iterrows():
+        dict_mapping_app_to_revenue_multiplier_special_case[str(row['app_id'])] = {'cleaned_publisher_name': row['cleaned_publisher_name'], 'revenue_multiplier': row['revenue_multiplier']}
+    
+    def cast_adjusted_cleaned_publisher_name(row):
+        if str(row['app_id']) in dict_mapping_app_to_revenue_multiplier_special_case.keys():
+            return dict_mapping_app_to_revenue_multiplier_special_case[str(row['app_id'])]['cleaned_publisher_name']
+        else:
+            return row['cleaned_publisher_name']
+    
+    def cast_adjusted_revenue_multiplier(row):
+        if str(row['app_id']) in dict_mapping_app_to_revenue_multiplier_special_case.keys():
+            return dict_mapping_app_to_revenue_multiplier_special_case[str(row['app_id'])]['revenue_multiplier']
+        else:
+            return row['revenue_multiplier']
+    
+    df_app_full_info_adjusted_copy = df_app_full_info_adjusted.copy()
+
+    df_app_full_info_adjusted_copy['cleaned_publisher_name'] = df_app_full_info_adjusted_copy.apply(cast_adjusted_cleaned_publisher_name, axis=1)
+    df_app_full_info_adjusted_copy['revenue_multiplier'] = df_app_full_info_adjusted_copy.apply(cast_adjusted_revenue_multiplier, axis=1)
+
+    return df_app_full_info_adjusted_copy
