@@ -6,6 +6,7 @@ from math import ceil
 import copy
 import random
 from datetime import datetime, timedelta, date
+import time
 import matplotlib.pyplot as plt
 import plotly.graph_objects as go
 import ast
@@ -383,7 +384,7 @@ def get_unified_id(local_app_id):
 def get_apps_performance(api_key, base_url, os, app_ids, country_code, granularity, max_periods, start_date, end_date):
     
     def split_date_range(start_date, end_date, granularity, max_periods):
-        
+        # max_periods = max number of periods in a range (the periods can be arbitrary - daily, weekly, monthly, quarterly, etc.)
         current_start = datetime.strptime(start_date, '%Y-%m-%d')
         final_end = datetime.strptime(end_date, '%Y-%m-%d')
         date_ranges = []
@@ -1851,3 +1852,71 @@ def adjust_cleaned_publisher_name_and_revenue_multiplier_of_app_full_info_specia
     df_app_full_info_adjusted_copy['revenue_multiplier'] = df_app_full_info_adjusted_copy.apply(cast_adjusted_revenue_multiplier, axis=1)
 
     return df_app_full_info_adjusted_copy
+
+def create_table_app_performance_grouped_by_game_daily(api_key, base_url, str_start_date, str_end_date, df_app_full_info, json_export_path):
+    # get the unified ids
+    list_unified_ids = list(
+        df_app_full_info['unified_app_id'].drop_duplicates()
+    )
+    
+    ## get the ios app_ids
+    list_app_ids_ios = list(
+        map(lambda x: str(x),
+            list(
+                    df_app_full_info[
+                        df_app_full_info['os'] == 'ios'
+                    ]['app_id']
+                )
+            )
+    )
+
+    ## get the android app_ids
+    list_app_ids_android = list(
+        map(lambda x: str(x),
+            list(
+                    df_app_full_info[
+                        df_app_full_info['os'] == 'android'
+                    ]['app_id']
+                )
+            )
+    )
+
+    # Query the app performance data (performance piece - each in a period, for an app)
+
+    print("Query app performance data pieces...")
+
+    app_performance_data_ios = get_apps_performance(
+        api_key, 
+        base_url, 
+        os = 'ios', 
+        app_ids = list_app_ids_ios, 
+        country_code = 'VN', 
+        granularity = 'daily', 
+        max_periods = 1000, 
+        start_date = str_start_date, 
+        end_date = str_end_date
+    )
+
+    app_performance_data_android = get_apps_performance(
+        api_key, 
+        base_url, 
+        os = 'android', 
+        app_ids = list_app_ids_android, 
+        country_code = 'VN', 
+        granularity = 'daily', 
+        max_periods = 1000, 
+        start_date = str_start_date, 
+        end_date = str_end_date
+    )
+    
+    ## join the 2 lists of performance data together
+    print("Concatenating the Android and iOS lists...")
+    app_performance_data = app_performance_data_ios + app_performance_data_android
+
+    ## export the data to json
+    print("Exporting the data to json...")
+    timestamp = int(time.time())
+    with open('{}/st_app_performance_daily_{}.json'.format(json_export_path, timestamp), 'w', encoding='utf-8') as file:
+        json.dump(app_performance_data, file, ensure_ascii=False, indent=4)
+
+    return app_performance_data
