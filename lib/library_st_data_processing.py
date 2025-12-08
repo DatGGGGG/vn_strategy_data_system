@@ -11,6 +11,9 @@ import matplotlib.pyplot as plt
 import plotly.graph_objects as go
 import ast
 import json
+import ijson
+from tqdm import tqdm
+import os
 
 pd.set_option('display.float_format', '{:.0f}'.format)
 
@@ -1917,6 +1920,62 @@ def create_table_app_performance_grouped_by_game_daily(api_key, base_url, str_st
     print("Exporting the data to json...")
     timestamp = int(time.time())
     with open('{}/st_app_performance_daily_{}.json'.format(json_export_path, timestamp), 'w', encoding='utf-8') as file:
-        json.dump(app_performance_data, file, ensure_ascii=False, indent=4)
+        json.dump(app_performance_data, file, ensure_ascii=False)
 
     return app_performance_data
+
+def stream_and_adjust_app_performance_daily_json_file(src_path, dst_path, df_app_full_info_adjusted):
+    
+    # Get the mapping app_id => revenue_multiplier
+    df_mult = df_app_full_info_adjusted[df_app_full_info_adjusted['revenue_multiplier']!=1][['app_id','revenue_multiplier']].copy()
+    df_mult["app_id_str"] = df_mult["app_id"].astype(str)
+    revenue_factor_by_app = (
+        df_mult.set_index("app_id_str")["revenue_multiplier"].to_dict()
+    )
+
+    # Supporting function to adjust revenue of each record
+    def adjust_revenue(rec):
+        aid_str = str(rec.get("aid"))
+        factor = revenue_factor_by_app.get(aid_str)
+
+        # If no multiplier (or factor == 1), just return as-is
+        if factor is None or factor == 1:
+            return rec
+
+        # iOS: ir = iPhone revenue, ar = iPad revenue
+        if "ir" in rec and rec["ir"] is not None:
+            rec["ir"] = rec["ir"] * factor
+        if "ar" in rec and rec["ar"] is not None:
+            rec["ar"] = rec["ar"] * factor
+
+        # Android: r = Android revenue
+        if "r" in rec and rec["r"] is not None:
+            rec["r"] = rec["r"] * factor
+
+        return rec
+    
+    # Streaming and adjusting original app performance data file to adjusted app performance data file
+    print("Streaming and adjusting app performance daily file: {} => {}".format(src_path, dst_path))
+
+    total_bytes = os.path.getsize(src_path)
+
+    with open(src_path, "rb") as src, \
+        open(dst_path, "w", encoding="utf-8") as dst, \
+        tqdm(total=total_bytes, unit="B", unit_scale=True, desc="Processing") as pbar:
+
+        dst.write("[\n")
+        first = True
+
+        for rec in ijson.items(src, "item"):
+            rec = adjust_revenue(rec)
+
+            if not first:
+                dst.write(",\n")
+            first = False
+
+            json.dump(rec, dst, ensure_ascii=False)
+
+            # update progress to current file position
+            pbar.update(src.tell() - pbar.n)
+
+        dst.write("\n]\n")
