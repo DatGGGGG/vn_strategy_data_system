@@ -1979,3 +1979,41 @@ def stream_and_adjust_app_performance_daily_json_file(src_path, dst_path, df_app
             pbar.update(src.tell() - pbar.n)
 
         dst.write("\n]\n")
+
+def apply_game_info_adjustments(df_game_full_info: pd.DataFrame,
+                                df_game_info_adjustment: pd.DataFrame,
+                                key: str = "unified_app_id") -> pd.DataFrame:
+    """
+    Return df_game_full_info with metadata updated by df_game_info_adjustment.
+
+    - key: column used to identify games (default: 'unified_app_id')
+    - Any columns present in df_game_info_adjustment will be used to update
+      matching rows in df_game_full_info.
+    - If df_game_info_adjustment has new columns not in df_game_full_info,
+      those columns are added.
+    - If multiple rows in df_game_info_adjustment share the same key,
+      the *last* one is used.
+    """
+    # Work on copies so we don't modify original dataframes
+    full = df_game_full_info.copy()
+    adj = df_game_info_adjustment.copy()
+
+    # Keep last adjustment per unified_app_id (if duplicates exist)
+    adj = adj.drop_duplicates(subset=[key], keep="last")
+
+    # Set index to the key for alignment
+    full = full.set_index(key)
+    adj = adj.set_index(key)
+
+    # Ensure all adjustment columns exist in full; if not, create them
+    for col in adj.columns:
+        if col not in full.columns:
+            full[col] = pd.NA
+
+    # Update in-place: aligns on index (key) and column names
+    full.update(adj)
+
+    # Restore key as a normal column
+    full = full.reset_index()
+
+    return full
