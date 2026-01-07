@@ -14,8 +14,22 @@ import json
 import ijson
 from tqdm import tqdm
 import os
+import ast
+import csv
+from typing import Any, Dict, Optional, Tuple
 
 pd.set_option('display.float_format', '{:.0f}'.format)
+
+def _to_int_or_none(x) -> Optional[int]:
+    if x is None:
+        return None
+    s = str(x).strip()
+    if s == "":
+        return None
+    try:
+        return int(float(s))  # handles "1", "1.0"
+    except Exception:
+        return None
 
 def chunk_list(lst, chunk_size):
     """
@@ -344,6 +358,55 @@ def get_local_app_info(api_key, base_url, os, app_ids):
     
     return all_responses
 
+# A new get_local_app_info version, optimized for SQL-friendly data files
+def get_local_app_info_iter(api_key, base_url, os, app_ids, *, chunk_size=100, sleep_s=0.15, timeout_s=60, max_retries=6):
+    """
+    Yields app dicts from SensorTower API, chunk by chunk.
+    """
+    endpoint = f"/v1/{os}/apps"
+    url = f"{base_url}{endpoint}"
+
+    headers = {"Authorization": f"Bearer {api_key}"}
+    total_chunks = (len(app_ids) + chunk_size - 1) // chunk_size
+
+    for chunk_idx, app_id_chunk in enumerate(chunk_list(app_ids, chunk_size), start=1):
+        params = {"app_ids": ",".join(str(x) for x in app_id_chunk)}
+
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                resp = requests.get(url, headers=headers, params=params, timeout=timeout_s)
+            except requests.RequestException as e:
+                if attempt >= max_retries:
+                    print(f"\n[{os}] chunk {chunk_idx}/{total_chunks} network error (giving up): {e}")
+                    break
+                backoff = min(60, 2 ** (attempt - 1))
+                print(f"\n[{os}] chunk {chunk_idx}/{total_chunks} network error: {e} | retry in {backoff}s")
+                time.sleep(backoff)
+                continue
+
+            if resp.status_code == 200:
+                apps = resp.json().get("apps", [])
+                for app in apps:
+                    yield app
+                break
+
+            if resp.status_code in (429, 500, 502, 503, 504):
+                if attempt >= max_retries:
+                    print(f"\n[{os}] chunk {chunk_idx}/{total_chunks} HTTP {resp.status_code} (giving up): {resp.text[:200]}")
+                    break
+                retry_after = resp.headers.get("Retry-After")
+                backoff = int(retry_after) if (retry_after and retry_after.isdigit()) else min(60, 2 ** (attempt - 1))
+                print(f"\n[{os}] chunk {chunk_idx}/{total_chunks} HTTP {resp.status_code} | retry in {backoff}s")
+                time.sleep(backoff)
+                continue
+
+            print(f"\n[{os}] chunk {chunk_idx}/{total_chunks} failed HTTP {resp.status_code}: {resp.text[:200]}")
+            break
+
+        time.sleep(sleep_s)
+
 def get_local_app_info_from_game_full_info_table(api_key, base_url, df_game_full_info):
     
     print("Extracting app list from game table...")
@@ -379,7 +442,89 @@ def get_local_app_info_from_game_full_info_table(api_key, base_url, df_game_full
         ignore_index=True
     )
 
-    return df_all_app_info_list.drop_duplicates()
+    return df_all_app_info_list
+
+# A new get_local_app_info_from_game_full_info_table version, optimized for SQL-friendly data files
+def get_local_app_info_from_game_full_info_table_ndjson_version(
+    api_key, base_url, df_game_full_info, timestamp, out_dir="data/base"
+):
+    print("Extracting app list from game table...")
+
+    ios_ids = []
+    android_ids = []
+
+    for _, row in df_game_full_info.iterrows():
+        itunes_apps = ast.literal_eval(str(row.get("itunes_apps")))
+        android_apps = ast.literal_eval(str(row.get("android_apps")))
+
+        # iOS: numeric app_id
+        if isinstance(itunes_apps, list):
+            for a in itunes_apps:
+                if isinstance(a, dict) and "app_id" in a and a["app_id"] is not None:
+                    try:
+                        ios_ids.append(int(a["app_id"]))
+                    except Exception:
+                        # just skip weird ones
+                        pass
+
+        # Android: package name (string) OR sometimes numeric -> keep as string always
+        if isinstance(android_apps, list):
+            for a in android_apps:
+                if isinstance(a, dict) and "app_id" in a and a["app_id"] is not None:
+                    android_ids.append(str(a["app_id"]).strip())
+
+    # de-dup while preserving order
+    def dedup(seq):
+        seen = set()
+        out = []
+        for x in seq:
+            if x not in seen:
+                seen.add(x)
+                out.append(x)
+        return out
+
+    ios_ids = dedup(ios_ids)
+    android_ids = dedup(android_ids)
+
+    print(f"iOS app_ids: {len(ios_ids):,}")
+    print(f"Android app_ids: {len(android_ids):,}")
+
+    out_path = f"{out_dir}/st_api_app_full_info_{timestamp}.ndjson"
+
+    total_target = len(ios_ids) + len(android_ids)
+    written = 0
+    start = time.time()
+    last_print = 0.0
+
+    def progress(os_name):
+        nonlocal last_print
+        now = time.time()
+        if now - last_print < 0.2:
+            return
+        elapsed = now - start
+        speed = written / elapsed if elapsed > 0 else 0.0
+        pct = (written / total_target * 100.0) if total_target > 0 else 100.0
+        print(f"\r{pct:6.2f}%  written={written:,}/{total_target:,}  {speed:,.1f} apps/s  (now: {os_name})", end="")
+        last_print = now
+
+    with open(out_path, "w", encoding="utf-8", newline="") as f_out:
+        print("Getting iOS apps info (writing NDJSON)...")
+        for app in get_local_app_info_iter(api_key, base_url, "ios", ios_ids):
+            f_out.write(json.dumps(app, ensure_ascii=False) + "\n")
+            written += 1
+            progress("ios")
+
+        print("\nGetting Android apps info (writing NDJSON)...")
+        for app in get_local_app_info_iter(api_key, base_url, "android", android_ids):
+            f_out.write(json.dumps(app, ensure_ascii=False) + "\n")
+            written += 1
+            progress("android")
+
+    print()
+    print(f"Done. Wrote: {out_path}")
+    print(f"Apps written: {written:,}")
+
+    return out_path
 
 def get_unified_id(local_app_id):
     return list(filter(lambda x: x['app_id'] == local_app_id, local_id_to_unified_id_mapping))[0]['unified_app_id']
@@ -2017,3 +2162,190 @@ def apply_game_info_adjustments(df_game_full_info: pd.DataFrame,
     full = full.reset_index()
 
     return full
+
+# New set of functions for adjusting App Full Info (NDJSON to NDJSON instead of csv to csv)
+
+def build_publisher_maps(mapping_csv_path: str) -> Tuple[Dict[str, str], Dict[str, int]]:
+    """
+    Build:
+      - dict_publisher_id_cleaned_publisher_name: publisher_id(str) -> cleaned_publisher_name(str)
+      - dict_publisher_id_revenue_multiplier:    publisher_id(str) -> revenue_multiplier(int)
+    Mirrors your pandas mapping logic (publisher_id-based).
+    """
+    dict_publisher_id_cleaned_publisher_name: Dict[str, str] = {}
+    dict_publisher_id_revenue_multiplier: Dict[str, int] = {}
+
+    with open(mapping_csv_path, "r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            pid = str(row.get("publisher_id") or "").strip()
+            if not pid:
+                continue
+
+            cleaned = row.get("cleaned_publisher_name")
+            if cleaned is None:
+                cleaned = ""
+            cleaned = str(cleaned)
+
+            rm = _to_int_or_none(row.get("revenue_multiplier"))
+            if rm is None:
+                rm = 1
+
+            dict_publisher_id_cleaned_publisher_name[pid] = cleaned
+            dict_publisher_id_revenue_multiplier[pid] = rm
+
+    return dict_publisher_id_cleaned_publisher_name, dict_publisher_id_revenue_multiplier
+
+
+def build_special_case_map(special_case_csv_path: str) -> Dict[str, Dict[str, Any]]:
+    """
+    Build special-case map:
+      app_id(str) -> {"cleaned_publisher_name": ..., "revenue_multiplier": ...}
+    Mirrors your pandas special-case mapping logic.
+    """
+    out: Dict[str, Dict[str, Any]] = {}
+
+    with open(special_case_csv_path, "r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            app_id = str(row.get("app_id") or "").strip()
+            if not app_id:
+                continue
+
+            cleaned = row.get("cleaned_publisher_name")
+            # keep as-is; could be empty string in your csv
+            if cleaned is None:
+                cleaned = ""
+
+            rm = _to_int_or_none(row.get("revenue_multiplier"))
+            # if missing in special-case row, we keep None so we can "not override" if you prefer
+            out[app_id] = {
+                "cleaned_publisher_name": str(cleaned),
+                "revenue_multiplier": rm,
+            }
+
+    return out
+
+
+def add_cleaned_publisher_name_and_revenue_multiplier_to_app_full_info_obj(
+    obj: Dict[str, Any],
+    dict_publisher_id_cleaned_publisher_name: Dict[str, str],
+    dict_publisher_id_revenue_multiplier: Dict[str, int],
+) -> Dict[str, Any]:
+    """
+    Record-level version of add_cleaned_publisher_name_and_revenue_multiplier_to_app_full_info().
+
+    If publisher_id in map:
+      cleaned_publisher_name = map[publisher_id]
+      revenue_multiplier = map[publisher_id]
+    Else:
+      cleaned_publisher_name = ""
+      revenue_multiplier = 1
+    """
+    pid = obj.get("publisher_id")
+    pid_s = str(pid).strip() if pid is not None else ""
+
+    if pid_s in dict_publisher_id_cleaned_publisher_name:
+        obj["cleaned_publisher_name"] = dict_publisher_id_cleaned_publisher_name[pid_s]
+    else:
+        obj["cleaned_publisher_name"] = ""
+
+    if pid_s in dict_publisher_id_revenue_multiplier:
+        obj["revenue_multiplier"] = dict_publisher_id_revenue_multiplier[pid_s]
+    else:
+        obj["revenue_multiplier"] = 1
+
+    return obj
+
+
+def adjust_cleaned_publisher_name_and_revenue_multiplier_of_app_full_info_special_cases_obj(
+    obj: Dict[str, Any],
+    dict_mapping_app_to_revenue_multiplier_special_case: Dict[str, Dict[str, Any]],
+) -> Dict[str, Any]:
+    """
+    Record-level version of adjust_cleaned_publisher_name_and_revenue_multiplier_of_app_full_info_special_cases().
+
+    If app_id in special-case map:
+      cleaned_publisher_name = special["cleaned_publisher_name"]  (even if "")
+      revenue_multiplier = special["revenue_multiplier"]          (only if not None)
+    Else:
+      keep current obj values
+    """
+    app_id = obj.get("app_id")
+    app_id_s = str(app_id).strip() if app_id is not None else ""
+
+    if app_id_s in dict_mapping_app_to_revenue_multiplier_special_case:
+        special = dict_mapping_app_to_revenue_multiplier_special_case[app_id_s]
+        obj["cleaned_publisher_name"] = special.get("cleaned_publisher_name", obj.get("cleaned_publisher_name"))
+
+        rm = special.get("revenue_multiplier", None)
+        if rm is not None:
+            obj["revenue_multiplier"] = rm
+
+    return obj
+
+
+def adjust_ndjson_app_full_info(
+    input_ndjson_path: str,
+    output_ndjson_path: str,
+    publisher_mapping_csv_path: str,
+    special_case_csv_path: str,
+    dedup_key: str = "app_id",
+):
+    """
+    Streaming NDJSON -> NDJSON
+      1) add cleaned_publisher_name + revenue_multiplier by publisher_id mapping
+      2) apply special-case overrides by app_id
+      3) drop duplicates by dedup_key (keep first)
+      4) progress bar by bytes (works well for large files)
+
+    Output: one JSON object per line (NDJSON).
+    """
+    pub_clean_map, pub_rm_map = build_publisher_maps(publisher_mapping_csv_path)
+    special_map = build_special_case_map(special_case_csv_path)
+
+    total_bytes = os.path.getsize(input_ndjson_path)
+    bar = None
+    if tqdm:
+        bar = tqdm(total=total_bytes, unit="B", unit_scale=True, desc="Adjusting NDJSON")
+
+    seen = set()
+    written = 0
+    skipped_dupes = 0
+
+    with open(input_ndjson_path, "r", encoding="utf-8") as f_in, open(output_ndjson_path, "w", encoding="utf-8", newline="") as f_out:
+        for line in f_in:
+            if bar:
+                bar.update(len(line.encode("utf-8", errors="ignore")))
+
+            line = line.strip()
+            if not line:
+                continue
+
+            obj = json.loads(line)
+
+            # dedup (like pandas drop_duplicates keep="first")
+            k = obj.get(dedup_key)
+            if k is not None:
+                ks = str(k).strip()
+                if ks in seen:
+                    skipped_dupes += 1
+                    continue
+                seen.add(ks)
+
+            # Apply your two steps
+            obj = add_cleaned_publisher_name_and_revenue_multiplier_to_app_full_info_obj(
+                obj, pub_clean_map, pub_rm_map
+            )
+            obj = adjust_cleaned_publisher_name_and_revenue_multiplier_of_app_full_info_special_cases_obj(
+                obj, special_map
+            )
+
+            f_out.write(json.dumps(obj, ensure_ascii=False) + "\n")
+            written += 1
+
+    if bar:
+        bar.close()
+
+    print(f"Done. Output: {output_ndjson_path}")
+    print(f"Written: {written:,} | Skipped duplicates: {skipped_dupes:,}")
