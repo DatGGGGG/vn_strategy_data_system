@@ -1,3 +1,4 @@
+from __future__ import annotations
 import pandas as pd
 import numpy as np
 import requests
@@ -16,9 +17,31 @@ from tqdm import tqdm
 import os
 import ast
 import csv
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union, Iterable, Sequence
 
 pd.set_option('display.float_format', '{:.0f}'.format)
+
+# CONSTANTS
+
+TimeoutType = Union[float, int, Tuple[float, float]]  # seconds or (connect, read)
+
+RETENTION_FIELDS_DAILY = [
+    "est_retention_d1",
+    "est_retention_d2",
+    "est_retention_d3",
+    "est_retention_d4",
+    "est_retention_d5",
+    "est_retention_d6",
+    "est_retention_d7",
+    "est_retention_d14",
+    "est_retention_d30",
+    "est_retention_d60",
+    "est_retention_d90",
+    "est_retention_d180",
+    "est_retention_d365",
+]
+
+# FUNCTIONS
 
 def _to_int_or_none(x) -> Optional[int]:
     if x is None:
@@ -133,6 +156,58 @@ def add_days_to_date(date_str, days_to_add):
     new_date_obj = date_obj + timedelta(days=days_to_add)
     # Convert back to a string and return
     return new_date_obj.strftime("%Y-%m-%d")
+
+def _get_with_retry(
+    url: str,
+    *,
+    params: Dict[str, Any],
+    timeout: TimeoutType = (10, 60),
+    max_retries: int = 6,
+    base_sleep: float = 1.5,
+    max_sleep: float = 60,
+) -> requests.Response:
+    """
+    Retry on connection resets/timeouts and on 429/5xx with exponential backoff + jitter.
+    Supports timeout as a single number OR (connect_timeout, read_timeout).
+    """
+    attempt = 0
+    last_exc: Optional[Exception] = None
+
+    while True:
+        attempt += 1
+        try:
+            resp = requests.get(url, params=params, timeout=timeout)
+
+            # Retryable HTTP statuses
+            if resp.status_code in (429, 500, 502, 503, 504):
+                if attempt >= max_retries:
+                    return resp
+
+                sleep_s = min(max_sleep, base_sleep * (2 ** (attempt - 1))) + random.random()
+
+                # honor Retry-After if provided
+                ra = resp.headers.get("Retry-After")
+                if ra:
+                    try:
+                        sleep_s = max(float(ra), sleep_s)
+                    except Exception:
+                        pass
+
+                time.sleep(sleep_s)
+                continue
+
+            return resp
+
+        except (
+            requests.exceptions.ConnectionError,
+            requests.exceptions.Timeout,
+            requests.exceptions.ChunkedEncodingError,
+        ) as e:
+            last_exc = e
+            if attempt >= max_retries:
+                raise
+            sleep_s = min(max_sleep, base_sleep * (2 ** (attempt - 1))) + random.random()
+            time.sleep(sleep_s)
 
 def get_unified_app_data(api_key, base_url, app_ids):
     """
@@ -2349,3 +2424,1182 @@ def adjust_ndjson_app_full_info(
 
     print(f"Done. Output: {output_ndjson_path}")
     print(f"Written: {written:,} | Skipped duplicates: {skipped_dupes:,}")
+
+    from datetime import datetime, timedelta
+import requests
+
+def chunk_list(items, chunk_size):
+    """Yield successive chunks from items."""
+    for i in range(0, len(items), chunk_size):
+        yield items[i:i + chunk_size]
+
+def get_apps_active_users(
+    api_key: str,
+    base_url: str,
+    ios_app_ids: list,
+    android_app_ids: list,
+    country_codes: str,
+    start_date: str,
+    end_date: str,
+    max_periods: int = 1000,
+    data_model: str = "DM_2025_Q2",
+    app_chunk_size: int = 500,
+    request_timeout: int = 60,
+    show_progress: bool = True,
+):
+    """
+    Fetch DAU/WAU/MAU (active users) for iOS + Android apps and return unified records.
+
+    Output per record:
+      app_id, country, date,
+      dau_android, dau_iphone, dau_ipad,
+      wau_android, wau_iphone, wau_ipad,
+      mau_android, mau_iphone, mau_ipad
+    """
+
+    def split_date_range(start_date: str, end_date: str, time_period: str, max_periods: int):
+        current_start = datetime.strptime(start_date, "%Y-%m-%d")
+        final_end = datetime.strptime(end_date, "%Y-%m-%d")
+        ranges = []
+
+        if time_period == "day":
+            step_days = max_periods
+            while current_start <= final_end:
+                current_end = min(current_start + timedelta(days=step_days - 1), final_end)
+                ranges.append((current_start.strftime("%Y-%m-%d"), current_end.strftime("%Y-%m-%d")))
+                current_start = current_end + timedelta(days=1)
+
+        elif time_period == "week":
+            while current_start <= final_end:
+                current_end = current_start + timedelta(days=max_periods * 7 - 1)
+                current_end = min(current_end, final_end)
+                # align to Sunday (weeks begin Monday)
+                current_end = current_end + timedelta(days=(6 - current_end.weekday()))
+                current_end = min(current_end, final_end)
+
+                ranges.append((current_start.strftime("%Y-%m-%d"), current_end.strftime("%Y-%m-%d")))
+                current_start = current_end + timedelta(days=1)
+
+        elif time_period == "month":
+            while current_start <= final_end:
+                current_end = current_start + timedelta(days=max_periods * 30 - 1)
+                current_end = min(current_end, final_end)
+                month_end = (current_end.replace(day=1) + timedelta(days=32)).replace(day=1) - timedelta(days=1)
+                current_end = min(month_end, final_end)
+
+                ranges.append((current_start.strftime("%Y-%m-%d"), current_end.strftime("%Y-%m-%d")))
+                current_start = (current_end.replace(day=1) + timedelta(days=32)).replace(day=1)
+
+        else:
+            raise ValueError("time_period must be one of: day, week, month")
+
+        return ranges
+
+    def fetch_one_os_timeperiod(os_name: str, app_ids: list, time_period: str):
+        if not app_ids:
+            return []
+
+        endpoint = f"/v1/{os_name}/usage/active_users"
+        url = f"{base_url}{endpoint}"
+        headers = {"Authorization": f"Bearer {api_key}"}
+
+        date_ranges = split_date_range(start_date, end_date, time_period, max_periods)
+
+        # Precompute number of requests = date_ranges * app_chunks
+        n_chunks = (len(app_ids) + app_chunk_size - 1) // app_chunk_size
+        total_requests = len(date_ranges) * n_chunks
+
+        desc = f"{os_name.upper()} {time_period.upper()} requests"
+        pbar = tqdm(total=total_requests, desc=desc, disable=not show_progress)
+
+        all_rows = []
+        for dr_start, dr_end in date_ranges:
+            for app_chunk in chunk_list(app_ids, app_chunk_size):
+                params = {
+                    "app_ids": ",".join(map(str, app_chunk)),
+                    "time_period": time_period,
+                    "start_date": dr_start,
+                    "end_date": dr_end,
+                    "countries": country_codes,
+                    "data_model": data_model,
+                }
+
+                resp = requests.get(url, headers=headers, params=params, timeout=request_timeout)
+
+                if resp.status_code != 200:
+                    pbar.close()
+                    raise RuntimeError(
+                        f"SensorTower active_users failed: os={os_name}, time_period={time_period}, "
+                        f"range={dr_start}..{dr_end}, status={resp.status_code}, body={resp.text[:500]}"
+                    )
+
+                payload = resp.json()
+                if isinstance(payload, dict):
+                    payload = payload.get("data", [])
+                if not isinstance(payload, list):
+                    pbar.close()
+                    raise RuntimeError(f"Unexpected response format: {type(payload)}")
+
+                all_rows.extend(payload)
+                pbar.update(1)
+
+        pbar.close()
+        return all_rows
+
+    # Top-level progress (6 blocks: iOS/Android × day/week/month)
+    blocks = [
+        ("ios", ios_app_ids, "day"),
+        ("ios", ios_app_ids, "week"),
+        ("ios", ios_app_ids, "month"),
+        ("android", android_app_ids, "day"),
+        ("android", android_app_ids, "week"),
+        ("android", android_app_ids, "month"),
+    ]
+
+    block_pbar = tqdm(total=len(blocks), desc="Fetching blocks", disable=not show_progress)
+
+    ios_day = fetch_one_os_timeperiod("ios", ios_app_ids, "day");     block_pbar.update(1)
+    ios_week = fetch_one_os_timeperiod("ios", ios_app_ids, "week");   block_pbar.update(1)
+    ios_month = fetch_one_os_timeperiod("ios", ios_app_ids, "month"); block_pbar.update(1)
+
+    android_day = fetch_one_os_timeperiod("android", android_app_ids, "day");     block_pbar.update(1)
+    android_week = fetch_one_os_timeperiod("android", android_app_ids, "week");   block_pbar.update(1)
+    android_month = fetch_one_os_timeperiod("android", android_app_ids, "month"); block_pbar.update(1)
+
+    block_pbar.close()
+
+    # Merge into unified records keyed by (app_id, country, date)
+    merged = {}
+
+    def ensure_row(app_id, country, date):
+        k = (str(app_id), str(country), str(date))
+        if k not in merged:
+            merged[k] = {
+                "app_id": str(app_id),
+                "country": country,
+                "date": date,
+                "dau_android": None,
+                "dau_iphone": None,
+                "dau_ipad": None,
+                "wau_android": None,
+                "wau_iphone": None,
+                "wau_ipad": None,
+                "mau_android": None,
+                "mau_iphone": None,
+                "mau_ipad": None,
+            }
+        return merged[k]
+
+    def apply_ios(rows, prefix):
+        for r in rows:
+            row = ensure_row(r.get("app_id"), r.get("country"), r.get("date"))
+            row[f"{prefix}_iphone"] = r.get("iphone_users")
+            row[f"{prefix}_ipad"] = r.get("ipad_users")
+
+    def apply_android(rows, prefix):
+        for r in rows:
+            row = ensure_row(r.get("app_id"), r.get("country"), r.get("date"))
+            row[f"{prefix}_android"] = r.get("users")
+
+    apply_ios(ios_day, "dau")
+    apply_ios(ios_week, "wau")
+    apply_ios(ios_month, "mau")
+
+    apply_android(android_day, "dau")
+    apply_android(android_week, "wau")
+    apply_android(android_month, "mau")
+
+    return list(merged.values())
+
+def create_table_app_active_users(
+    api_key,
+    base_url,
+    str_start_date,
+    str_end_date,
+    df_app_full_info,
+    json_export_path,
+    country_codes="VN",
+    max_periods=1000,
+    data_model="DM_2025_Q2",
+):
+    """
+    Fetch DAU/WAU/MAU active users for iOS + Android apps in df_app_full_info,
+    unified into rows with:
+      app_id, country, date,
+      dau_android, dau_iphone, dau_ipad,
+      wau_android, wau_iphone, wau_ipad,
+      mau_android, mau_iphone, mau_ipad
+
+    Exports a timestamped JSON file to json_export_path and returns the list.
+    """
+
+    # iOS app IDs (as ints/strings both ok; we normalize to str for transport)
+    list_app_ids_ios = list(
+        map(lambda x: str(x),
+            list(
+                df_app_full_info[df_app_full_info["os"] == "ios"]["app_id"]
+            )
+        )
+    )
+
+    # Android package names
+    list_app_ids_android = list(
+        map(lambda x: str(x),
+            list(
+                df_app_full_info[df_app_full_info["os"] == "android"]["app_id"]
+            )
+        )
+    )
+
+    print("Query app active users (DAU/WAU/MAU)...")
+    print(f"Countries: {country_codes} | Start: {str_start_date} | End: {str_end_date}")
+    print(f"iOS apps: {len(list_app_ids_ios):,} | Android apps: {len(list_app_ids_android):,}")
+
+    # Fetch unified records
+    active_users_data = get_apps_active_users(
+        api_key=api_key,
+        base_url=base_url,
+        ios_app_ids=list_app_ids_ios,
+        android_app_ids=list_app_ids_android,
+        country_codes=country_codes,
+        start_date=str_start_date,
+        end_date=str_end_date,
+        max_periods=max_periods,
+        data_model=data_model,
+        show_progress=True,
+    )
+
+    # Export to JSON
+    print("Exporting active users data to json...")
+    timestamp = int(time.time())
+
+    # safe-ish country label for filenames
+    country_label = country_codes.replace(",", "-").replace(" ", "")
+    out_path = f"{json_export_path}/st_app_active_users_{country_label}_{str_start_date}_{str_end_date}_{timestamp}.json"
+
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(active_users_data, f, ensure_ascii=False)
+
+    print(f"✅ Exported: {out_path}")
+    return active_users_data
+
+def _add_months(dt: datetime, months: int) -> datetime:
+    # Add months while keeping day in range
+    y = dt.year + (dt.month - 1 + months) // 12
+    m = (dt.month - 1 + months) % 12 + 1
+    d = min(dt.day, [31,
+                     29 if (y % 4 == 0 and (y % 100 != 0 or y % 400 == 0)) else 28,
+                     31, 30, 31, 30, 31, 31, 30, 31, 30, 31][m - 1])
+    return dt.replace(year=y, month=m, day=d)
+
+def _month_end(dt: datetime) -> datetime:
+    first_next = _add_months(dt.replace(day=1), 1)
+    return first_next - timedelta(days=1)
+
+def split_month_ranges(start_date: str, end_date: str, max_months: int):
+    """
+    Split [start_date, end_date] into ranges of <= max_months months,
+    aligned to month boundaries as much as possible.
+    """
+    start = datetime.strptime(start_date, "%Y-%m-%d")
+    end = datetime.strptime(end_date, "%Y-%m-%d")
+
+    ranges = []
+    cur = start
+
+    while cur <= end:
+        # tentative end = end of month after (max_months-1) months
+        end_month_dt = _add_months(cur.replace(day=1), max_months - 1)
+        cur_end = _month_end(end_month_dt)
+        if cur_end > end:
+            cur_end = end
+        ranges.append((cur.strftime("%Y-%m-%d"), cur_end.strftime("%Y-%m-%d")))
+        cur = cur_end + timedelta(days=1)
+
+    return ranges
+
+def get_apps_retention_daily(
+    api_key: str,
+    base_url: str,
+    app_ids: list,
+    region_codes: str,
+    start_date: str,
+    end_date: str,
+    *,
+    max_months_per_request: int = 6,
+    app_chunk_size: int = 500,
+    request_timeout: int = 60,
+    show_progress: bool = True,
+):
+    """
+    Fetch daily retention metrics (D1, D2..D7, D14, D30, D60, D90, D180, D365)
+    for a set of app_ids, within region_codes and date window.
+
+    Returns: list[dict] with fields:
+      app_id, country, date,
+      est_retention_d1, est_retention_d2, ... est_retention_d365
+    """
+
+    if not app_ids:
+        return []
+
+    # Normalize regions like "VN, TH" -> ["VN","TH"]
+    regions = [r.strip() for r in region_codes.split(",") if r.strip()]
+    if not regions:
+        raise ValueError("region_codes must contain at least one region code, e.g. 'VN' or 'VN,TH'.")
+
+    url = f"{base_url}/v1/facets/metrics"
+
+    # Split the date window into month-aligned chunks
+    date_ranges = split_month_ranges(start_date, end_date, max_months_per_request)
+
+    # Estimate total requests for progress bar
+    num_app_chunks = (len(app_ids) + app_chunk_size - 1) // app_chunk_size
+    total_requests = len(regions) * len(date_ranges) * num_app_chunks
+
+    pbar = tqdm(total=total_requests, desc="Retention daily requests", disable=not show_progress)
+
+    results = []
+
+    for region in regions:
+        for dr_start, dr_end in date_ranges:
+            for app_chunk in chunk_list(app_ids, app_chunk_size):
+
+                # This endpoint (per your curl screenshot) uses auth_token in query
+                params = {
+                    "retention": "",  # flag-style param from docs: ?retention
+                    "bundle": "retention_daily",
+                    "breakdown": "date,app_id",
+                    "start_date": dr_start,
+                    "end_date": dr_end,
+                    "regions": region,
+                    "app_ids": ",".join(map(str, app_chunk)),
+                    "auth_token": api_key,
+                }
+
+                resp = requests.get(url, params=params, timeout=request_timeout)
+
+                if resp.status_code != 200:
+                    pbar.close()
+                    raise RuntimeError(
+                        f"Retention API failed: region={region}, range={dr_start}..{dr_end}, "
+                        f"status={resp.status_code}, body={resp.text[:800]}"
+                    )
+
+                payload = resp.json()
+                data = payload.get("data", []) if isinstance(payload, dict) else payload
+                if not isinstance(data, list):
+                    pbar.close()
+                    raise RuntimeError(f"Unexpected response format: {type(data)}")
+
+                # Normalize output schema
+                for row in data:
+                    out = {
+                        "app_id": str(row.get("app_id")) if row.get("app_id") is not None else None,
+                        "country": region,
+                        "date": row.get("date"),
+                    }
+                    for k in RETENTION_FIELDS_DAILY:
+                        out[k] = row.get(k)  # default None if missing
+                    results.append(out)
+
+                pbar.update(1)
+
+    pbar.close()
+    return results
+
+def iter_apps_retention_daily(
+    api_key: str,
+    base_url: str,
+    app_ids: list,
+    region_codes: str,
+    start_date: str,
+    end_date: str,
+    *,
+    max_months_per_request: int = 6,
+    app_chunk_size: int = 200,
+    request_timeout: int = 120,
+    show_progress: bool = True,
+):
+    """
+    Stream daily retention rows (generator). Does NOT accumulate all results in memory.
+    Yields dicts with:
+      app_id, country, date, est_retention_d1..d365
+    """
+    if not app_ids:
+        return
+        yield  # make generator happy
+
+    regions = [r.strip() for r in region_codes.split(",") if r.strip()]
+    if not regions:
+        raise ValueError("region_codes must contain at least one region code, e.g. 'VN' or 'VN,TH'.")
+
+    url = f"{base_url}/v1/facets/metrics"
+    date_ranges = split_month_ranges(start_date, end_date, max_months_per_request)
+
+    num_app_chunks = (len(app_ids) + app_chunk_size - 1) // app_chunk_size
+    total_requests = len(regions) * len(date_ranges) * num_app_chunks
+    pbar = tqdm(total=total_requests, desc="Retention daily requests", disable=not show_progress)
+
+    for region in regions:
+        for dr_start, dr_end in date_ranges:
+            for app_chunk in chunk_list(app_ids, app_chunk_size):
+
+                params = {
+                    "retention": "",  # flag-style param (?retention)
+                    "bundle": "retention_daily",
+                    "breakdown": "date,app_id",
+                    "start_date": dr_start,
+                    "end_date": dr_end,
+                    "regions": region,
+                    "app_ids": ",".join(map(str, app_chunk)),
+                    "auth_token": api_key,
+                }
+
+                resp = _get_with_retry(
+                    url,
+                    params=params,
+                    timeout=request_timeout,
+                    max_retries=6,
+                    base_sleep=1.5,
+                    max_sleep=60,
+                )
+
+                if resp.status_code != 200:
+                    pbar.close()
+                    raise RuntimeError(
+                        f"Retention API failed: region={region}, range={dr_start}..{dr_end}, "
+                        f"status={resp.status_code}, body={resp.text[:800]}"
+                    )
+
+                payload = resp.json()
+                data = payload.get("data", []) if isinstance(payload, dict) else payload
+                if not isinstance(data, list):
+                    pbar.close()
+                    raise RuntimeError(f"Unexpected response format: {type(data)}")
+
+                for row in data:
+                    out = {
+                        "app_id": str(row.get("app_id")) if row.get("app_id") is not None else None,
+                        "country": region,
+                        "date": row.get("date"),
+                    }
+                    for k in RETENTION_FIELDS_DAILY:
+                        out[k] = row.get(k)
+                    yield out
+
+                pbar.update(1)
+
+    pbar.close()
+
+def create_table_app_retention_daily_ndjson(
+    api_key,
+    base_url,
+    str_start_date,
+    str_end_date,
+    df_app_full_info,
+    ndjson_export_path,
+    region_codes="VN",
+    max_months_per_request=6,
+    app_chunk_size=500,
+    show_progress=True,
+):
+    """
+    Streaming NDJSON export for daily retention.
+    - Does NOT build/return a giant in-memory list.
+    - Writes one JSON object per line to an .ndjson file.
+
+    Returns: (out_path, record_count)
+    """
+
+    # iOS app_ids
+    list_app_ids_ios = list(
+        map(lambda x: str(x),
+            list(df_app_full_info[df_app_full_info["os"] == "ios"]["app_id"])
+        )
+    )
+
+    # Android bundle ids
+    list_app_ids_android = list(
+        map(lambda x: str(x),
+            list(df_app_full_info[df_app_full_info["os"] == "android"]["app_id"])
+        )
+    )
+
+    # Combine + dedupe
+    app_ids = sorted(set(list_app_ids_ios + list_app_ids_android))
+
+    print("Query retention daily metrics (streaming to NDJSON)...")
+    print(f"Regions: {region_codes} | Start: {str_start_date} | End: {str_end_date}")
+    print(f"Total apps: {len(app_ids):,} (iOS={len(list_app_ids_ios):,}, Android={len(list_app_ids_android):,})")
+
+    # Output path
+    timestamp = int(time.time())
+    region_label = region_codes.replace(",", "-").replace(" ", "")
+    out_path = (
+        f"{ndjson_export_path}/st_app_retention_daily_{region_label}_"
+        f"{str_start_date}_{str_end_date}_{timestamp}.ndjson"
+    )
+
+    record_count = 0
+    with open(out_path, "w", encoding="utf-8") as f:
+        for rec in iter_apps_retention_daily(
+            api_key=api_key,
+            base_url=base_url,
+            app_ids=app_ids,
+            region_codes=region_codes,
+            start_date=str_start_date,
+            end_date=str_end_date,
+            max_months_per_request=max_months_per_request,
+            app_chunk_size=app_chunk_size,
+            show_progress=show_progress,
+        ):
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            record_count += 1
+
+    print(f"✅ Exported: {out_path}")
+    print(f"✅ Records written: {record_count:,}")
+    return out_path, record_count
+
+def get_app_reviews(
+    api_key: str,
+    base_url: str,
+    os_name: str,
+    app_ids: List[Any],
+    country_codes: str,
+    start_date: str,
+    end_date: str,
+    *,
+    limit: int = 200,                 # max 200 per docs
+    page_start: int = 1,
+    request_timeout: TimeoutType = (10, 60),
+    show_progress: bool = True,
+    verbose: bool = False,            # set True for page-by-page prints
+    max_pages_per_app_country: Optional[int] = None,  # for sampling/debug
+    ios_use_countries_param: bool = True,             # True: countries=VN,TH; False: loop like android
+) -> List[Dict[str, Any]]:
+    """
+    Fetch detailed user reviews for apps.
+
+    Output fields:
+      app_id, country, date, review_id, username, rating, title, version, tags,
+      content, sentiment, permalink, store_language
+
+    Behavior:
+    - Progress bar updates PER PAGE request (so it won't look frozen).
+    - For iOS:
+        - Default: one run per app with `countries=VN,TH,...` (fewer calls)
+        - Optional: set ios_use_countries_param=False to call per country like android
+    - For Android:
+        - Calls per (app_id, country) using `country=VN`
+    """
+    os_name = os_name.lower().strip()
+    if os_name not in ("ios", "android"):
+        raise ValueError("os_name must be 'ios' or 'android'")
+
+    countries = [c.strip() for c in country_codes.split(",") if c.strip()]
+    if not countries:
+        raise ValueError("country_codes must contain at least one country code, e.g. 'VN' or 'VN,TH'")
+
+    if limit > 200 or limit <= 0:
+        raise ValueError("limit must be between 1 and 200")
+
+    url = f"{base_url}/v1/{os_name}/review/get_reviews"
+    results: List[Dict[str, Any]] = []
+
+    # Per-page progress bar (unknown total)
+    pbar = tqdm(
+        total=None,
+        desc=f"Fetching {os_name} reviews (pages)",
+        disable=not show_progress,
+        mininterval=0.2,
+    )
+
+    def _emit_reviews(feedback: list, fallback_country: Optional[str]):
+        for r in feedback:
+            results.append({
+                "app_id": str(r.get("app_id", "")),
+                "country": r.get("country") or fallback_country,
+                "date": r.get("date"),
+                "review_id": r.get("id"),
+                "username": r.get("username"),
+                "rating": r.get("rating"),
+                "title": r.get("title"),
+                "version": r.get("version"),
+                "tags": r.get("tags") if isinstance(r.get("tags"), list) else [],
+                "content": r.get("content"),
+                "sentiment": r.get("sentiment"),
+                "permalink": r.get("permalink"),
+                "store_language": r.get("store_language"),
+            })
+
+    for app_id in app_ids:
+        app_id_str = str(app_id)
+
+        if os_name == "ios" and ios_use_countries_param:
+            # Single call stream for all selected iOS countries
+            batches = [("countries", ",".join(countries))]
+        else:
+            # Per-country calls (Android always, and optionally iOS)
+            batches = [("country", c) for c in countries]
+
+        for mode, country_val in batches:
+            page = page_start
+            page_count: Optional[int] = None
+            pages_fetched = 0
+
+            while True:
+                params: Dict[str, Any] = {
+                    "app_id": app_id_str,
+                    "start_date": start_date,
+                    "end_date": end_date,
+                    "limit": limit,
+                    "page": page,
+                    "auth_token": api_key,
+                }
+                params[mode] = country_val
+
+                # heartbeat in tqdm
+                pbar.set_postfix(app=app_id_str, c=country_val, page=page, pages=page_count)
+
+                if verbose:
+                    print(f"[{os_name}] app={app_id_str} {mode}={country_val} page={page} ...")
+
+                resp = _get_with_retry(url, params=params, timeout=request_timeout)
+
+                if resp.status_code != 200:
+                    raise RuntimeError(
+                        f"Review API failed: os={os_name}, app_id={app_id_str}, {mode}={country_val}, "
+                        f"page={page}, status={resp.status_code}, body={resp.text[:800]}"
+                    )
+
+                payload = resp.json() if resp.content else {}
+                if not isinstance(payload, dict):
+                    raise RuntimeError(f"Unexpected response format: {type(payload)}")
+
+                feedback = payload.get("feedback", [])
+                if not isinstance(feedback, list):
+                    raise RuntimeError(f"Unexpected feedback format: {type(feedback)}")
+
+                if page_count is None:
+                    pc = payload.get("page_count")
+                    try:
+                        page_count = int(pc) if pc is not None else None
+                    except Exception:
+                        page_count = None
+
+                # Fallback country when API doesn't provide it (should usually provide)
+                fallback_country = None
+                if mode == "country":
+                    fallback_country = country_val
+                elif mode == "countries" and len(countries) == 1:
+                    fallback_country = countries[0]
+
+                _emit_reviews(feedback, fallback_country)
+
+                if verbose:
+                    got = len(feedback)
+                    if page_count is not None:
+                        print(f"  -> got {got} reviews (page {page}/{page_count})")
+                    else:
+                        print(f"  -> got {got} reviews (page {page})")
+
+                # progress updates per request/page
+                pbar.update(1)
+                pages_fetched += 1
+
+                # Stop conditions
+                if max_pages_per_app_country is not None and pages_fetched >= max_pages_per_app_country:
+                    break
+
+                if page_count is not None:
+                    if page >= page_count:
+                        break
+                else:
+                    # If no page_count, stop when short page or empty
+                    if not feedback or len(feedback) < limit:
+                        break
+
+                page += 1
+
+    pbar.close()
+    return results
+
+def iter_app_reviews(
+    api_key: str,
+    base_url: str,
+    os_name: str,
+    app_ids: List[Any],
+    country_codes: str,
+    start_date: str,
+    end_date: str,
+    *,
+    limit: int = 200,
+    page_start: int = 1,
+    request_timeout: Any = (10, 60),
+    show_progress: bool = True,
+    verbose: bool = False,
+    ios_use_countries_param: bool = True,
+) -> Iterable[Dict[str, Any]]:
+    """
+    STREAM reviews page-by-page (generator). Does NOT store everything in memory.
+    Yields dicts with fields:
+      app_id, country, date, review_id, username, rating, title, version,
+      tags, content, sentiment, permalink, store_language
+    """
+    os_name = os_name.lower().strip()
+    if os_name not in ("ios", "android"):
+        raise ValueError("os_name must be 'ios' or 'android'")
+
+    countries = [c.strip() for c in country_codes.split(",") if c.strip()]
+    if not countries:
+        raise ValueError("country_codes must contain at least one country code, e.g. 'VN' or 'VN,TH'")
+
+    if limit <= 0 or limit > 200:
+        raise ValueError("limit must be between 1 and 200")
+
+    url = f"{base_url}/v1/{os_name}/review/get_reviews"
+
+    # Per-page progress (unknown total)
+    pbar = tqdm(
+        total=None,
+        desc=f"Fetching {os_name} reviews (pages)",
+        disable=not show_progress,
+        mininterval=0.2,
+    )
+
+    for app_id in app_ids:
+        app_id_str = str(app_id)
+
+        if os_name == "ios" and ios_use_countries_param:
+            batches = [("countries", ",".join(countries))]
+        else:
+            batches = [("country", c) for c in countries]
+
+        for mode, country_val in batches:
+            page = page_start
+            page_count: Optional[int] = None
+
+            while True:
+                params: Dict[str, Any] = {
+                    "app_id": app_id_str,
+                    "start_date": start_date,
+                    "end_date": end_date,
+                    "limit": limit,
+                    "page": page,
+                    "auth_token": api_key,
+                }
+                params[mode] = country_val
+
+                pbar.set_postfix(app=app_id_str, c=country_val, page=page, pages=page_count)
+
+                if verbose:
+                    print(f"[{os_name}] app={app_id_str} {mode}={country_val} page={page} ...")
+
+                resp = _get_with_retry(url, params=params, timeout=request_timeout)
+
+                if resp.status_code != 200:
+                    pbar.close()
+                    raise RuntimeError(
+                        f"Review API failed: os={os_name}, app_id={app_id_str}, {mode}={country_val}, "
+                        f"page={page}, status={resp.status_code}, body={resp.text[:800]}"
+                    )
+
+                payload = resp.json() if resp.content else {}
+                if not isinstance(payload, dict):
+                    pbar.close()
+                    raise RuntimeError(f"Unexpected response format: {type(payload)}")
+
+                feedback = payload.get("feedback", [])
+                if not isinstance(feedback, list):
+                    pbar.close()
+                    raise RuntimeError(f"Unexpected feedback format: {type(feedback)}")
+
+                if page_count is None:
+                    pc = payload.get("page_count")
+                    try:
+                        page_count = int(pc) if pc is not None else None
+                    except Exception:
+                        page_count = None
+
+                fallback_country = country_val if mode == "country" else (countries[0] if len(countries) == 1 else None)
+
+                for r in feedback:
+                    yield {
+                        "app_id": str(r.get("app_id", app_id_str)),
+                        "country": r.get("country") or fallback_country,
+                        "date": r.get("date"),
+                        "review_id": r.get("id"),
+                        "username": r.get("username"),
+                        "rating": r.get("rating"),
+                        "title": r.get("title"),
+                        "version": r.get("version"),
+                        "tags": r.get("tags") if isinstance(r.get("tags"), list) else [],
+                        "content": r.get("content"),
+                        "sentiment": r.get("sentiment"),
+                        "permalink": r.get("permalink"),
+                        "store_language": r.get("store_language"),
+                    }
+
+                pbar.update(1)
+
+                # Stop conditions
+                if page_count is not None:
+                    if page >= page_count:
+                        break
+                else:
+                    if not feedback or len(feedback) < limit:
+                        break
+
+                page += 1
+
+    pbar.close()
+
+def create_table_app_user_reviews_ndjson_streaming(
+    api_key: str,
+    base_url: str,
+    str_start_date: str,
+    str_end_date: str,
+    df_app_full_info,
+    ndjson_export_path: str,
+    *,
+    country_codes: str = "VN",
+    limit: int = 200,
+    request_timeout: Any = (10, 60),
+    show_progress: bool = True,
+    verbose: bool = False,
+) -> Tuple[str, int]:
+    """
+    BIG-DATA wrapper: streams reviews and writes NDJSON line-by-line.
+    Does NOT keep reviews in memory.
+
+    Returns: (out_path, record_count)
+    """
+
+    ios_app_ids: List[str] = list(
+        map(lambda x: str(x),
+            list(df_app_full_info[df_app_full_info["os"] == "ios"]["app_id"])
+        )
+    )
+    android_app_ids: List[str] = list(
+        map(lambda x: str(x),
+            list(df_app_full_info[df_app_full_info["os"] == "android"]["app_id"])
+        )
+    )
+
+    print("Fetching user reviews (STREAMING -> NDJSON)...")
+    print(f"Countries: {country_codes} | Start: {str_start_date} | End: {str_end_date}")
+    print(f"Apps: iOS={len(ios_app_ids):,} | Android={len(android_app_ids):,}")
+    print("Tip: This can be very large (millions of reviews). NDJSON is the right choice.")
+
+    timestamp = int(time.time())
+    country_label = country_codes.replace(",", "-").replace(" ", "")
+    out_path = (
+        f"{ndjson_export_path}/st_app_user_reviews_{country_label}_"
+        f"{str_start_date}_{str_end_date}_{timestamp}.ndjson"
+    )
+
+    record_count = 0
+
+    with open(out_path, "w", encoding="utf-8") as f:
+        # Android
+        if android_app_ids:
+            for rec in iter_app_reviews(
+                api_key=api_key,
+                base_url=base_url,
+                os_name="android",
+                app_ids=android_app_ids,
+                country_codes=country_codes,
+                start_date=str_start_date,
+                end_date=str_end_date,
+                limit=limit,
+                request_timeout=request_timeout,
+                show_progress=show_progress,
+                verbose=verbose,
+            ):
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                record_count += 1
+
+        # iOS
+        if ios_app_ids:
+            for rec in iter_app_reviews(
+                api_key=api_key,
+                base_url=base_url,
+                os_name="ios",
+                app_ids=ios_app_ids,
+                country_codes=country_codes,
+                start_date=str_start_date,
+                end_date=str_end_date,
+                limit=limit,
+                request_timeout=request_timeout,
+                show_progress=show_progress,
+                verbose=verbose,
+                ios_use_countries_param=True,   # iOS supports countries=VN,TH,...
+            ):
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                record_count += 1
+
+    print(f"✅ Exported: {out_path}")
+    print(f"✅ Records written: {record_count:,}")
+    return out_path, record_count
+
+def get_apps_demographics_all_time(
+    *,
+    api_key: str,
+    base_url: str,
+    os_name: str,  # "ios" or "android"
+    app_ids: Sequence[Union[str, int]],
+    country_code: str = "SE_ASIA",
+    # all_time ignores dates, but API still requires them -> send safe wide range
+    start_date: str = "2015-10-01",
+    end_date: Optional[str] = None,  # defaults to yesterday
+    date_granularity: str = "all_time",  # keep default as required by your case
+    app_chunk_size: int = 500,
+    timeout: float = 60.0,
+    show_progress: bool = True,
+) -> List[Dict[str, Any]]:
+    """
+    Fetch Sensor Tower demographics (usage/demographics) for many apps.
+
+    Output fields (per row):
+      app_id, country, date, date_granularity, confidence, average_age_total, female, male,
+      normalized_demographics_female_18, normalized_demographics_female_25, normalized_demographics_female_35,
+      normalized_demographics_female_45, normalized_demographics_female_55,
+      normalized_demographics_male_18, normalized_demographics_male_25, normalized_demographics_male_35,
+      normalized_demographics_male_45, normalized_demographics_male_55
+    """
+    os_name = str(os_name).strip().lower()
+    if os_name not in {"ios", "android"}:
+        raise ValueError("os_name must be 'ios' or 'android'")
+
+    if end_date is None:
+        end_date = (date.today().fromordinal(date.today().toordinal() - 1)).isoformat()
+
+    url = f"{base_url}/v1/{os_name}/usage/demographics"
+
+    # Normalize app ids to strings for the API
+    app_ids_str = [str(x) for x in app_ids if str(x).strip() != ""]
+    chunks = chunk_list(app_ids_str, app_chunk_size)
+
+    fetched_at = date.today().isoformat()
+
+    out_rows: List[Dict[str, Any]] = []
+
+    iterator = chunks
+    if show_progress:
+        iterator = tqdm(chunks, desc=f"Fetching {os_name} demographics", unit="chunk")
+
+    for chunk in iterator:
+        params = {
+            "auth_token": api_key,
+            "app_ids": ",".join(chunk),
+            "country": country_code,
+            "date_granularity": date_granularity,
+            "start_date": start_date,
+            "end_date": end_date,
+        }
+
+        resp = _get_with_retry(url, params=params, timeout=timeout)
+        if resp.status_code != 200:
+            # fail fast with useful info (don’t silently swallow)
+            raise RuntimeError(
+                f"Demographics request failed: {resp.status_code} {resp.text[:1000]}"
+            )
+
+        payload = resp.json() or {}
+        app_data = payload.get("app_data") or []
+
+        # app_data is a list of objects
+        for item in app_data:
+            nd = item.get("normalized_demographics") or {}
+
+            row = {
+                "app_id": item.get("app_id"),
+                "country": item.get("country", country_code),
+                "date": fetched_at,  # date you fetched this snapshot
+                "date_granularity": item.get("date_granularity", date_granularity),
+                "confidence": item.get("confidence"),
+                "average_age_total": item.get("average_age_total"),
+                "female": item.get("female"),
+                "male": item.get("male"),
+                "normalized_demographics_female_18": nd.get("female_18"),
+                "normalized_demographics_female_25": nd.get("female_25"),
+                "normalized_demographics_female_35": nd.get("female_35"),
+                "normalized_demographics_female_45": nd.get("female_45"),
+                "normalized_demographics_female_55": nd.get("female_55"),
+                "normalized_demographics_male_18": nd.get("male_18"),
+                "normalized_demographics_male_25": nd.get("male_25"),
+                "normalized_demographics_male_35": nd.get("male_35"),
+                "normalized_demographics_male_45": nd.get("male_45"),
+                "normalized_demographics_male_55": nd.get("male_55"),
+            }
+            out_rows.append(row)
+
+    return out_rows
+
+def iter_apps_demographics_all_time(
+    *,
+    api_key: str,
+    base_url: str,
+    os_name: str,  # "ios" or "android"
+    app_ids: Sequence[Union[str, int]],
+    country_code: str = "SE_ASIA",
+    start_date: str = "2020-01-01",   # required by API even for all_time
+    end_date: Optional[str] = None,
+    date_granularity: str = "all_time",
+    app_chunk_size: int = 500,
+    timeout: Any = 60,
+    show_progress: bool = True,
+) -> Iterable[Dict[str, Any]]:
+    """
+    Stream Sensor Tower demographics rows for many apps (generator).
+    Requires your existing _get_with_retry(url, params=..., timeout=...).
+
+    Yields dicts with fields:
+      app_id, country, date, date_granularity, confidence, average_age_total, female, male,
+      normalized_demographics_female_18..55, normalized_demographics_male_18..55
+    """
+    os_name = str(os_name).strip().lower()
+    if os_name not in {"ios", "android"}:
+        raise ValueError("os_name must be 'ios' or 'android'")
+
+    if end_date is None:
+        # yesterday (safe default)
+        end_date = (date.today().fromordinal(date.today().toordinal() - 1)).isoformat()
+
+    url = f"{base_url}/v1/{os_name}/usage/demographics"
+
+    app_ids_str = [str(x) for x in app_ids if str(x).strip() != ""]
+    chunks = [app_ids_str[i:i + app_chunk_size] for i in range(0, len(app_ids_str), app_chunk_size)]
+
+    fetched_at = date.today().isoformat()
+
+    iterator = chunks
+    if show_progress:
+        iterator = tqdm(chunks, desc=f"Fetching {os_name} demographics", unit="chunk")
+
+    for chunk in iterator:
+        params = {
+            "auth_token": api_key,
+            "app_ids": ",".join(chunk),
+            "country": country_code,
+            "date_granularity": date_granularity,
+            "start_date": start_date,
+            "end_date": end_date,
+        }
+
+        resp = _get_with_retry(url, params=params, timeout=timeout)
+        if resp.status_code != 200:
+            raise RuntimeError(f"Demographics request failed: {resp.status_code} {resp.text[:1000]}")
+
+        payload = resp.json() or {}
+        app_data = payload.get("app_data") or []
+
+        for item in app_data:
+            nd = item.get("normalized_demographics") or {}
+
+            yield {
+                "app_id": item.get("app_id"),
+                "country": item.get("country", country_code),
+                "date": fetched_at,  # snapshot fetch date
+                "date_granularity": item.get("date_granularity", date_granularity),
+                "confidence": item.get("confidence"),
+                "average_age_total": item.get("average_age_total"),
+                "female": item.get("female"),
+                "male": item.get("male"),
+                "normalized_demographics_female_18": nd.get("female_18"),
+                "normalized_demographics_female_25": nd.get("female_25"),
+                "normalized_demographics_female_35": nd.get("female_35"),
+                "normalized_demographics_female_45": nd.get("female_45"),
+                "normalized_demographics_female_55": nd.get("female_55"),
+                "normalized_demographics_male_18": nd.get("male_18"),
+                "normalized_demographics_male_25": nd.get("male_25"),
+                "normalized_demographics_male_35": nd.get("male_35"),
+                "normalized_demographics_male_45": nd.get("male_45"),
+                "normalized_demographics_male_55": nd.get("male_55"),
+            }
+
+
+def create_table_app_demographics_all_time_ndjson_streaming(
+    api_key: str,
+    base_url: str,
+    df_app_full_info,
+    ndjson_export_path: str,
+    *,
+    country_code: str = "SE_ASIA",
+    start_date: str = "2020-01-01",      # required even for all_time
+    end_date: Optional[str] = None,
+    date_granularity: str = "all_time",
+    app_chunk_size: int = 500,
+    timeout: Any = 60,
+    show_progress: bool = True,
+) -> Tuple[str, int]:
+    """
+    Wrapper like retention/active-users:
+    - Uses df_app_full_info to get iOS + Android app_ids
+    - Streams API results directly to NDJSON (no giant in-memory list)
+    - Returns (out_path, record_count)
+    """
+
+    ios_app_ids: List[str] = list(
+        map(lambda x: str(x),
+            list(df_app_full_info[df_app_full_info["os"] == "ios"]["app_id"])
+        )
+    )
+    android_app_ids: List[str] = list(
+        map(lambda x: str(x),
+            list(df_app_full_info[df_app_full_info["os"] == "android"]["app_id"])
+        )
+    )
+
+    print("Fetching demographics (ALL_TIME) -> NDJSON (streaming)...")
+    print(f"Country: {country_code} | date_granularity={date_granularity}")
+    print(f"Apps: iOS={len(ios_app_ids):,} | Android={len(android_app_ids):,}")
+
+    ts = int(time.time())
+    out_path = (
+        f"{ndjson_export_path}/st_app_demographics_{country_code}_"
+        f"{date_granularity}_{ts}.ndjson"
+    )
+
+    n = 0
+    with open(out_path, "w", encoding="utf-8") as f:
+        # Android
+        if android_app_ids:
+            for rec in iter_apps_demographics_all_time(
+                api_key=api_key,
+                base_url=base_url,
+                os_name="android",
+                app_ids=android_app_ids,
+                country_code=country_code,
+                start_date=start_date,
+                end_date=end_date,
+                date_granularity=date_granularity,
+                app_chunk_size=app_chunk_size,
+                timeout=timeout,
+                show_progress=show_progress,
+            ):
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                n += 1
+
+        # iOS
+        if ios_app_ids:
+            for rec in iter_apps_demographics_all_time(
+                api_key=api_key,
+                base_url=base_url,
+                os_name="ios",
+                app_ids=ios_app_ids,
+                country_code=country_code,
+                start_date=start_date,
+                end_date=end_date,
+                date_granularity=date_granularity,
+                app_chunk_size=app_chunk_size,
+                timeout=timeout,
+                show_progress=show_progress,
+            ):
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                n += 1
+
+    print(f"✅ Exported: {out_path}")
+    print(f"✅ Records written: {n:,}")
+    return out_path, n

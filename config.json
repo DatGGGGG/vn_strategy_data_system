@@ -1,0 +1,7 @@
+{
+    "TOP_GAME_ANNUAL_PERFORMANCE": "data/base/st_webdownload_annual_game_performance_1771831048.csv",
+    "MAPPING_PUBLISHER_TO_APPS_TOP_DOWN": "data/base/st_manualsearch_mapping_publisher_to_apps_top_down_1770810933.csv",
+    "MAPPING_PUBLISHER_TO_PUBLISER_ID_AND_REVENUE_MULTIPLIER_BOTTOM_UP": "data/base/st_manualsearch_mapping_publisher_to_publisherids_revenue_multiplier_bottom_up_1770897976.csv",
+    "MAPPING_APP_TO_REVENUE_MULTIPLIER_SPECIAL_CASES": "data/base/st_mapping_app_to_revenue_multiplier_special_case_1770980794.csv",
+    "GAME_INFO_ADJUSTMENT": "data/base/st_game_info_adjustment_1766745155.csv"
+}
